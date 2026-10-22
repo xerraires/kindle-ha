@@ -13,6 +13,11 @@ despertar RTC, mientras duerme.
 
 ![Aspecto del salvapantallas (diseño actual)](preview.png)
 
+> **Aviso (disclaimer):** este proyecto lo hice **sin tener mucha idea**, trastecando
+> por diversión y con mucha ayuda de IA (y de los foros de MobileRead). No lo uses
+> como guía de referencia ni para nada crítico: sigue los pasos bajo tu propia
+> responsabilidad, y el código puede tener errores — probablemente los tiene.
+
 *Cabecera con batería, pronóstico semanal con barras de rango y `Ahora XX°`,
 y precio de la luz PVPC protagonista: tramo `PUNTA`/`MEDIO`/`VALLE`, precio
 actual, próxima subida/bajada, barras 24 h y `MIN`/`MAX`.*
@@ -89,6 +94,10 @@ Además, el **plugin heartbeat** (batería del Kindle → HA) publica
 `last_seen`. Añade a tu `configuration.yaml` el sensor plantilla y la
 automatización de aviso de "batería baja" de [`ha/home-assistant.yaml`](ha/home-assistant.yaml).
 
+> Si el servidor no arruja y se queja de que no encuentra las fuentes DejaVu,
+> instala el paquete de tu distra (`fonts-dejavu` / `dejavu-sans-fonts` /
+> `ttf-dejavu`) o fija `FONT_DIR` en `.env` (ver `.env.example`).
+
 Necesitas un **token de acceso de larga duración** (Perfil → Seguridad →
 Tokens de acceso de larga duración) para el servidor de render y para el
 heartbeat.
@@ -164,9 +173,10 @@ Con el Kindle conectado por USB (o SSH):
    ```sh
    [ -n "$(pidof reader.lua)" ] && { logmsg "KOReader already running; not starting a second instance"; exit 0; }
    ```
-5. **Plugin heartbeat** (batería → HA): crea
-   `/mnt/us/koreader/plugins/heartbeat.koplugin/` y copia allí el plugin y la
-   plantilla de config [`koreader/plugins/heartbeat.koplugin/heartbeat_config.lua`](koreader/plugins/heartbeat.koplugin/heartbeat_config.lua)
+5. **Plugin heartbeat** (batería → HA): el plugin está **incluido en este repo**
+   (§ "Créditos": es el de Moritz John, licencia MIT). Copia la carpeta completa
+   `koreader/plugins/heartbeat.koplugin/` a `/mnt/us/koreader/plugins/` y edita ahí
+   la plantilla de config [`heartbeat_config.lua`](koreader/plugins/heartbeat.koplugin/heartbeat_config.lua)
    con tu IP de HA y tu token. Ajusta el nombre del sensor desde el menú del
    plugin (Tools → Heartbeat Configuration → Sensor Name).
 6. Reinicia KOReader, duerme el Kindle y verifica: imagen actualizada al
@@ -195,8 +205,11 @@ Con el Kindle conectado por USB (o SSH):
   [koreader-live-sleepscreen](https://github.com/file99/koreader-live-sleepscreen)
   (MIT, © file99), muy ampliado aquí (blindaje de `lipc`, watchdog de
   despertadas, refresco horario 24 h, refresco completo anti-ghosting).
+- Plugin [heartbeat.koplugin](https://github.com/moritz-john/heartbeat.koplugin)
+  de Moritz John (MIT), incluido en `koreader/plugins/heartbeat.koplugin/`
+  (batería del Kindle → `binary_sensor` en HA).
 - [KOReader](https://koreader.rocks) · [Home Assistant](https://www.home-assistant.io)
-  · [Kindle Modding Wiki](https://kindlemodging.org) · MobileRead.
+  · [Kindle Modding Wiki](https://kindlemodding.org) · MobileRead.
 - Proyecto desarrollado con [pi](https://github.com/earendil-works/pi), un
   agente de código que trabaja desde la terminal.
 - Licencia: [MIT](LICENSE) — usa el proyecto como quieras, trastéalo a gusto;
