@@ -1,0 +1,16 @@
+[Unit]
+Description=Kindle HA Screensaver (render PNG desde Home Assistant)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# TODO: ajusta WorkingDirectory y ExecStart a donde cloneste el repo
+WorkingDirectory=/opt/kindle-ha-repo/server
+ExecStart=/opt/kindle-ha-repo/server/run.sh
+Restart=always
+RestartSec=5
+User=TU_USUARIO
+
+[Install]
+WantedBy=multi-user.target

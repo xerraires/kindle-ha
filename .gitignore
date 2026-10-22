@@ -1,0 +1,9 @@
+# estado local / secretos
+.env
+state.json
+venv/
+__pycache__/
+*.pyc
+crash.log
+*.bak
+*.tar.gz

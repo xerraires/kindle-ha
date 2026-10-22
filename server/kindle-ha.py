@@ -1,0 +1,508 @@
+#!/usr/bin/env python3
+"""
+Servidor de salvapantallas para Kindle (Paperwhite 1: 758x1024).
+Consulta Home Assistant (clima + precio PVPC) y renderiza un PNG en
+escala de grises optimizado para tinta electrónica.
+
+Uso:
+  HA_URL=http://HOME-ASSISTANT:8123 HA_TOKEN=xxx PORT=8090 ./venv/bin/python kindle-ha.py
+
+Endpoints:
+  GET /kindle.png   -> imagen PNG 758x1024 (lo que pide el Kindle)
+  GET /             -> estado / ultima actualizacion
+"""
+import os
+import io
+import json
+import math
+import time
+import threading
+from datetime import datetime
+from urllib.parse import urlparse, parse_qs
+
+import requests
+from PIL import Image, ImageDraw, ImageFont
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# ---------------- Config (variables de entorno) ----------------
+HA_URL = os.environ.get("HA_URL", "http://homeassistant.local:8123").rstrip("/")
+HA_TOKEN = os.environ.get("HA_TOKEN", "")
+PORT = int(os.environ.get("PORT", "8090"))
+WEATHER_ENTITY = os.environ.get("WEATHER_ENTITY", "weather.home")
+PRICE_ENTITY = os.environ.get("PRICE_ENTITY", "sensor.esios_pvpc")
+TITLE = os.environ.get("TITLE", "CASA")  # rotulo de la cabecera del PNG
+W, H = 758, 1024
+DATA_TTL = int(os.environ.get("DATA_TTL", "300"))  # cache de datos HA (s)
+
+FONT_DIR = "/usr/share/fonts/truetype/dejavu"
+F_BOLD = os.path.join(FONT_DIR, "DejaVuSans-Bold.ttf")
+F_REG = os.path.join(FONT_DIR, "DejaVuSans.ttf")
+
+# ---------------- Caché de datos HA ----------------
+_cache = {"ts": 0.0, "data": None, "lock": threading.Lock()}
+
+# ---------------- Estado de bateria del Kindle ----------------
+# Lo envia el parche (2-live-sleepscreen.lua) como ?battery=NN&charging=0/1
+# en cada GET a /kindle.png. Se persiste para sobrevivir reinicios.
+_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
+_battery = {"level": None, "charging": None, "ts": 0.0}
+
+
+def _load_battery():
+    try:
+        with open(_STATE_FILE) as f:
+            d = json.load(f)
+        for k in ("level", "charging", "ts"):
+            if k in d:
+                _battery[k] = d[k]
+    except Exception:
+        pass
+
+
+def _save_battery():
+    try:
+        with open(_STATE_FILE, "w") as f:
+            json.dump(_battery, f)
+    except Exception:
+        pass
+
+
+_load_battery()
+
+
+def _fetch_ha():
+    headers = {"Authorization": f"Bearer {HA_TOKEN}",
+               "Content-Type": "application/json"}
+    data = {"weather": None, "prices": None, "current": None, "temp_now": None,
+            "min": None, "min_at": None, "max": None, "max_at": None,
+            "error": None}
+
+    # --- Clima: pronostico diario (7 dias) + temperatura actual ---
+    try:
+        r = requests.post(
+            f"{HA_URL}/api/services/weather/get_forecasts?return_response=1",
+            headers=headers,
+            json={"entity_id": WEATHER_ENTITY, "type": "daily"},
+            timeout=15,
+        )
+        r.raise_for_status()
+        resp = r.json().get("service_response", {}).get(WEATHER_ENTITY, {})
+        data["weather"] = resp.get("forecast", [])[:7]
+        r2 = requests.get(f"{HA_URL}/api/states/{WEATHER_ENTITY}",
+                          headers=headers, timeout=15)
+        r2.raise_for_status()
+        data["temp_now"] = r2.json().get("attributes", {}).get("temperature")
+    except Exception as e:
+        data["error"] = f"clima: {e}"
+
+    # --- Precio PVPC ---
+    try:
+        r = requests.get(f"{HA_URL}/api/states/{PRICE_ENTITY}",
+                         headers=headers, timeout=15)
+        r.raise_for_status()
+        s = r.json()
+        attrs = s.get("attributes", {})
+        prices = [attrs.get(f"price_{h:02d}h") for h in range(24)]
+        prices = [p for p in prices if isinstance(p, (int, float))]
+        data["prices"] = prices
+        data["current"] = float(s.get("state"))
+        data["min"] = attrs.get("min_price")
+        data["min_at"] = attrs.get("min_price_at")
+        data["max"] = attrs.get("max_price")
+        data["max_at"] = attrs.get("max_price_at")
+    except Exception as e:
+        data["error"] = (data["error"] + f"; precio: {e}") if data["error"] else f"precio: {e}"
+
+    if data.get("weather") or data.get("prices"):
+        data["fetched_at"] = time.time()
+    return data
+
+
+def get_data():
+    now = time.time()
+    with _cache["lock"]:
+        if _cache["data"] and (now - _cache["ts"]) < DATA_TTL:
+            return _cache["data"]
+    d = _fetch_ha()
+    with _cache["lock"]:
+        _cache["data"] = d
+        _cache["ts"] = time.time()
+    return d
+
+
+# ---------------- Utilidades de dibujo ----------------
+def font(size, bold=True):
+    return ImageFont.truetype(F_BOLD if bold else F_REG, size)
+
+
+def text_w(draw, s, fnt):
+    b = draw.textbbox((0, 0), s, font=fnt)
+    return b[2] - b[0]
+
+
+def draw_centered(draw, xy, s, fnt, fill=0):
+    w = text_w(draw, s, fnt)
+    x, y = xy
+    draw.text((x - w / 2, y), s, font=fnt, fill=fill)
+
+
+def draw_right(draw, xr, y, s, fnt, fill=0):
+    draw.text((xr - text_w(draw, s, fnt), y), s, font=fnt, fill=fill)
+
+
+def fmt_price(v):
+    return f"{v:.3f}".replace(".", ",")
+
+
+def price_band(prices, current):
+    """Terciles del dia -> ('VALLE'|'MEDIO'|'PUNTA', idx)."""
+    s = sorted(prices)
+    n = len(s)
+    t1, t2 = s[n // 3], s[(2 * n) // 3]
+    if current <= t1:
+        return "VALLE", 0
+    if current <= t2:
+        return "MEDIO", 1
+    return "PUNTA", 2
+
+
+def next_change(prices, cur_hour):
+    """(palabra, hora) de la proxima variacion notable, o None."""
+    if cur_hour < 0 or cur_hour >= len(prices) - 1:
+        return None
+    p0 = prices[cur_hour]
+    for h in range(cur_hour + 1, len(prices)):
+        diff = prices[h] - p0
+        if abs(diff) >= 0.005:
+            return ("Sube" if diff > 0 else "Baja", h)
+    return None
+
+
+COND_ES = {
+    "clear": "Despejado", "sunny": "Soleado",
+    "partly_cloudy": "Parc.nuboso", "cloudy": "Nuboso",
+    "fog": "Niebla", "hail": "Granizo",
+    "lightning": "Tormenta", "lightning-rainy": "Tormenta",
+    "pouring": "LluviaFte", "rainy": "Lluvia",
+    "snowy": "Nieve", "snowy-rainy": "Aguanieve",
+    "windy": "Viento", "windy-variant": "Viento",
+    "exceptional": "-",
+}
+
+WD_ES = ["LUN", "MAR", "MIE", "JUE", "VIE", "SAB", "DOM"]
+
+
+def draw_icon(draw, kind, cx, cy, r, fill=0):
+    """Iconos minimalistas en gris/negro para e-ink."""
+    k = (kind or "").replace("-", "_")
+    if "clear" in k or "sunny" in k:
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=fill, width=3)
+        for a in range(0, 360, 45):
+            import math
+            rad = math.radians(a)
+            x1 = cx + (r + 4) * math.cos(rad)
+            y1 = cy + (r + 4) * math.sin(rad)
+            x2 = cx + (r + 12) * math.cos(rad)
+            y2 = cy + (r + 12) * math.sin(rad)
+            draw.line([x1, y1, x2, y2], fill=fill, width=2)
+    elif "snowy" in k:
+        draw.ellipse([cx - r, cy - r * 0.7, cx + r, cy + r * 0.7],
+                     outline=fill, width=3)
+        for dx in (-r * 0.5, 0, r * 0.5):
+            draw.line([cx + dx, cy + r * 0.8, cx + dx, cy + r * 1.3],
+                      fill=fill, width=2)
+    elif "rainy" in k or "pouring" in k or "lightning" in k:
+        draw.ellipse([cx - r, cy - r * 0.7, cx + r, cy + r * 0.7],
+                     outline=fill, width=3)
+        for dx in (-r * 0.5, r * 0.2, r * 0.6):
+            draw.line([cx + dx, cy + r * 0.8, cx + dx - 3, cy + r * 1.3],
+                      fill=fill, width=2)
+        if "lightning" in k:
+            draw.polygon([(cx - 4, cy + r),
+                          (cx + 6, cy + r),
+                          (cx - 2, cy + r * 1.6),
+                          (cx + 8, cy + r * 1.6)],
+                         fill=fill)
+    elif "fog" in k:
+        for i, oy in enumerate((-r * 0.4, 0, r * 0.4)):
+            draw.line([cx - r, cy + oy, cx + r, cy + oy], fill=fill, width=3)
+    elif "windy" in k:
+        for i, oy in enumerate((-r * 0.4, 0, r * 0.4)):
+            draw.line([cx - r, cy + oy, cx + r * 0.6, cy + oy], fill=fill, width=3)
+    else:  # cloudy / default
+        draw.ellipse([cx - r, cy - r * 0.6, cx + r, cy + r * 0.6],
+                     outline=fill, width=3)
+        draw.ellipse([cx - r * 0.5, cy - r, cx + r * 0.7, cy + r * 0.2],
+                     outline=fill, width=3)
+
+
+# ---------------- Render principal ----------------
+def render():
+    img = Image.new("L", (W, H), 255)
+    d = ImageDraw.Draw(img)
+    data = get_data()
+
+    if data.get("error") and not (data.get("weather") or data.get("prices")):
+        f = font(40)
+        draw_centered(d, (W / 2, H / 2 - 20), "SIN DATOS HA", f)
+        f2 = font(22)
+        draw_centered(d, (W / 2, H / 2 + 30), str(data.get("error"))[:40], f2)
+        return img
+
+    now = datetime.now()
+    R = W - 24  # margen derecho
+
+    # ----- Cabecera -----
+    d.text((24, 8), TITLE, font=font(44), fill=0)
+    f_batt = font(18)
+    blvl = _battery.get("level")
+    if blvl is not None:
+        batt_txt = f"BATERIA {blvl}%"
+        if _battery.get("charging"):
+            batt_txt += " (CARGA)"
+    else:
+        batt_txt = "BATERIA --"
+    d.text((24, 60), batt_txt, font=f_batt, fill=0)
+
+    f_hora = font(30)
+    f_sub = font(18)
+    draw_right(d, R, 8, now.strftime("%H:%M"), f_hora)
+    draw_right(d, R, 44, now.strftime("%a %d %b").upper(), f_sub)
+    if data.get("fetched_at"):
+        upd = "ACTUALIZADO " + datetime.fromtimestamp(data["fetched_at"]).strftime("%H:%M")
+        draw_right(d, R, 68, upd, font(15), fill=128)
+
+    d.line([(20, 94), (W - 20, 94)], fill=0, width=2)
+
+    # ----- Tiempo (arriba): filas con barra de rango -----
+    if data.get("weather"):
+        days = data["weather"][:5]
+        rest = data["weather"][5:7]
+
+        f_sec = font(22)
+        d.text((24, 102), "PRONOSTICO", font=f_sec, fill=0)
+        if data.get("temp_now") is not None:
+            f_ahora = font(22)
+            txt = f"Ahora {round(data['temp_now'])}°"
+            draw_right(d, R, 102, txt, f_ahora)
+
+        # escala global de la semana para las barras de rango
+        tmaxs = [day["temperature"] for day in days if day.get("temperature") is not None]
+        tmins = [day["templow"] for day in days if day.get("templow") is not None]
+        gmin = min(tmins) if tmins else 0
+        gmax = max(tmaxs) if tmaxs else 30
+        span = max(gmax - gmin, 1)
+
+        f_day = font(26)
+        f_tmin = font(20)
+        f_tmax = font(26)
+        f_cond = font(15)
+        row_h = 50
+        y0 = 136
+        bx0, bx1 = 262, 540  # zona de la barra de rango
+
+        for i, day in enumerate(days):
+            cy = y0 + row_h * i + row_h / 2
+            dt = datetime.fromisoformat(day["datetime"])
+            wd = WD_ES[dt.weekday()] if i > 0 else "HOY"
+            d.text((24, cy - 16), wd, font=f_day, fill=0)
+
+            kind = day.get("condition", "")
+            draw_icon(d, kind, 168, cy, 17)
+
+            tmax = day.get("temperature")
+            tmin = day.get("templow")
+            if tmin is not None:
+                draw_right(d, bx0 - 16, cy - 12, f"{int(round(tmin))}°",
+                           f_tmin, fill=128)
+            if tmax is not None:
+                draw_right(d, bx1 + 70, cy - 16, f"{int(round(tmax))}°", f_tmax)
+
+            # barra de rango: linea gris + tramo negro [tmin..tmax] escalado
+            if tmin is not None and tmax is not None:
+                d.line([(bx0, cy), (bx1, cy)], fill=192, width=6)
+                xa = bx0 + (tmin - gmin) / span * (bx1 - bx0)
+                xb = bx0 + (tmax - gmin) / span * (bx1 - bx0)
+                d.line([(xa, cy), (xb, cy)], fill=0, width=6)
+                d.ellipse([xa - 4, cy - 4, xa + 4, cy + 4], fill=0)
+                d.ellipse([xb - 4, cy - 4, xb + 4, cy + 4], fill=0)
+
+            cond = COND_ES.get(kind, kind)
+            draw_right(d, R, cy - 9, cond, f_cond, fill=128)
+
+        if rest:
+            parts = []
+            for day in rest:
+                dt = datetime.fromisoformat(day["datetime"])
+                wd = WD_ES[dt.weekday()]
+                parts.append(f"{wd} {int(round(day['temperature']))}°/"
+                             f"{int(round(day['templow']))}°")
+            d.text((24, y0 + row_h * 5 + 2), "   ".join(parts),
+                   font=font(16), fill=128)
+
+    d.line([(20, 428), (W - 20, 428)], fill=128, width=2)
+
+    # ----- Precio (abajo): protagonista -----
+    f_sec = font(26)
+    d.text((24, 436), "PRECIO LUZ", font=f_sec, fill=0)
+
+    prices = data.get("prices")
+    current = data.get("current")
+
+    # badge de tramo (terciles del dia)
+    if prices and current is not None:
+        band, bi = price_band(prices, current)
+        f_badge = font(20)
+        tw = text_w(d, band, f_badge)
+        bw, bh = tw + 28, 34
+        bx, by = R - bw, 434
+        if bi == 2:      # PUNTA: negro, texto blanco
+            d.rectangle([bx, by, bx + bw, by + bh], fill=0)
+            d.text((bx + 14, by + 4), band, font=f_badge, fill=255)
+        elif bi == 1:    # MEDIO: gris
+            d.rectangle([bx, by, bx + bw, by + bh], fill=128)
+            d.text((bx + 14, by + 4), band, font=f_badge, fill=0)
+        else:            # VALLE: blanco con borde
+            d.rectangle([bx, by, bx + bw, by + bh], outline=0, width=3)
+            d.text((bx + 14, by + 4), band, font=f_badge, fill=0)
+
+    # precio actual, en grande
+    if current is not None:
+        f_big = font(92)
+        txt = fmt_price(current)
+        d.text((20, 478), txt, font=f_big, fill=0)
+        d.text((24 + text_w(d, txt, f_big) + 16, 545), "€/kWh",
+               font=font(26), fill=0)
+
+    # proxima subida/bajada
+    if prices:
+        cur_hour = now.hour if len(prices) == 24 else -1
+        nc = next_change(prices, cur_hour)
+        f_nc = font(22)
+        if nc:
+            word, h = nc
+            draw_right(d, R, 500, f"{word} a las {h:02d}h", f_nc)
+        else:
+            draw_right(d, R, 500, "Precio estable", f_nc, fill=128)
+
+    # barras 24h
+    if prices:
+        left, right = 40, 718
+        top, bottom = 640, 930
+        cw = right - left
+        n = len(prices)
+        slot = cw / n
+        bw = max(6, slot * 0.62)
+        vmax = max(prices)
+        if data.get("max"):
+            vmax = max(vmax, data["max"])
+        vmax = vmax * 1.08
+        cur_hour = now.hour if n == 24 else -1
+
+        # tramos por terciles (para pintar el valle)
+        s = sorted(prices)
+        t1 = s[n // 3]
+
+        d.line([(left, bottom), (right, bottom)], fill=0, width=2)
+        d.line([(left, top), (left, bottom)], fill=0, width=2)
+
+        for i, p in enumerate(prices):
+            x = left + slot * i + (slot - bw) / 2
+            h = (p / vmax) * (bottom - top)
+            y0b = bottom - h
+            if i == cur_hour:
+                d.rectangle([x, y0b, x + bw, bottom], fill=0)
+                # flecha sobre la hora actual
+                cx = x + bw / 2
+                d.polygon([(cx - 9, y0b - 20), (cx + 9, y0b - 20),
+                           (cx, y0b - 6)], fill=0)
+            elif p <= t1:
+                d.rectangle([x, y0b, x + bw, bottom], fill=128)
+            else:
+                d.rectangle([x, y0b, x + bw, bottom], outline=0, width=2)
+
+        # etiquetas eje X (cada 3h)
+        f_x = font(16)
+        for hh in (0, 3, 6, 9, 12, 15, 18, 21, 23):
+            if hh < n:
+                x = left + slot * hh + slot / 2
+                draw_centered(d, (x, bottom + 10), f"{hh:02d}h", f_x, fill=128)
+
+    # pie: min / max
+    f_mm = font(20)
+    if data.get("min") is not None:
+        draw_right(d, W // 2 - 16, 975,
+                   f"MIN {fmt_price(data['min'])} ({int(data['min_at']):02d}h)"
+                   if data.get("min_at") is not None
+                   else f"MIN {fmt_price(data['min'])}", f_mm)
+    if data.get("max") is not None:
+        mn = f"MAX {fmt_price(data['max'])}"
+        if data.get("max_at") is not None:
+            mn += f" ({int(data['max_at']):02d}h)"
+        d.text((W // 2 + 16, 975), mn, font=f_mm, fill=0)
+    return img
+
+
+def render_png():
+    img = render()
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+# ---------------- HTTP ----------------
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.startswith("/kindle.png"):
+            qs = parse_qs(urlparse(self.path).query)
+            if "battery" in qs:
+                try:
+                    lvl = int(qs["battery"][0])
+                    if 0 <= lvl <= 100:
+                        _battery["level"] = lvl
+                        _battery["charging"] = (qs.get("charging", ["0"])[0] == "1")
+                        _battery["ts"] = time.time()
+                        _save_battery()
+                        print(f"[battery] {lvl}% charged={_battery['charging']}")
+                except (ValueError, IndexError):
+                    pass
+            png = render_png()
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(png)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(png)
+        elif self.path.startswith("/force"):
+            get_data()  # refresca cache
+            self.send_response(302)
+            self.send_header("Location", "/")
+            self.end_headers()
+        else:
+            with _cache["lock"]:
+                ts = _cache["ts"]
+            msg = ("Kindle HA screensaver\n"
+                   f"Ultima actualizacion HA: "
+                   f"{datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S') if ts else 'nunca'}\n"
+                   f"PNG: http://<este-host>:{PORT}/kindle.png\n")
+            body = msg.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+def main():
+    if not HA_TOKEN:
+        print("AVISO: HA_TOKEN no definido; el render mostrara 'SIN DATOS HA'.")
+    srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    print(f"Sirviendo en 0.0.0.0:{PORT}  (PNG en /kindle.png)")
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

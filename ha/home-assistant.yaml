@@ -1,0 +1,22 @@
+# Fragmento para configuration.yaml de Home Assistant.
+# Sensor plantilla que expone la bateria que publica el plugin heartbeat
+# (entidad binary_sensor.koreader_status) + automatizacion de bateria baja.
+
+template:
+  - sensor:
+      - name: "Kindle Bateria"
+        unit_of_measurement: "%"
+        state: "{{ state_attr('binary_sensor.koreader_status','battery_level') }}"
+
+automation:
+  - alias: kindle_bateria_baja
+    trigger:
+      - platform: numeric_state
+        entity_id: binary_sensor.koreader_status
+        attribute: battery_level
+        below: 20
+    action:
+      - service: notify.notify
+        data:
+          title: "Kindle"
+          message: "Batería baja: {{ state_attr('binary_sensor.koreader_status','battery_level') }}%. Ponlo a cargar."
