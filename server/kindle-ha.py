@@ -15,8 +15,11 @@ import os
 import io
 import json
 import math
+import subprocess
+import sys
 import time
 import threading
+import traceback
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs
 
@@ -34,9 +37,40 @@ TITLE = os.environ.get("TITLE", "CASA")  # rotulo de la cabecera del PNG
 W, H = 758, 1024
 DATA_TTL = int(os.environ.get("DATA_TTL", "300"))  # cache de datos HA (s)
 
-FONT_DIR = "/usr/share/fonts/truetype/dejavu"
-F_BOLD = os.path.join(FONT_DIR, "DejaVuSans-Bold.ttf")
-F_REG = os.path.join(FONT_DIR, "DejaVuSans.ttf")
+# Fuentes DejaVu: rutas tipicas de varias distros + fc-match de fontconfig.
+# Se pueden fijar a mano con FONT_DIR (o FONT_BOLD/FONT_REG completos).
+def _find_font(basename, fc_pattern):
+    explicit = os.environ.get("FONT_BOLD" if "Bold" in basename else "FONT_REG")
+    if explicit and os.path.isfile(explicit):
+        return explicit
+    candidates = []
+    if os.environ.get("FONT_DIR"):
+        candidates.append(os.path.join(os.environ["FONT_DIR"], basename))
+    candidates += [
+        os.path.join(d, basename)
+        for d in (
+            "/usr/share/fonts/truetype/dejavu",   # Debian/Ubuntu/Raspberry Pi OS
+            "/usr/share/fonts/dejavu",             # Fedora
+            "/usr/share/fonts/dejavu-sans-fonts",   # Fedora (paquete separado)
+            "/usr/share/fonts/TTF",                # Arch
+        )
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    try:  # ultimo recurso: preguntarle a fontconfig
+        out = subprocess.check_output(
+            ["fc-match", "-f", "%{file}", fc_pattern],
+            text=True, timeout=10).strip()
+        if out and os.path.isfile(out):
+            return out
+    except Exception:
+        pass
+    return None
+
+
+F_BOLD = _find_font("DejaVuSans-Bold.ttf", "DejaVu Sans:bold")
+F_REG = _find_font("DejaVuSans.ttf", "DejaVu Sans")
 
 # ---------------- Caché de datos HA ----------------
 _cache = {"ts": 0.0, "data": None, "lock": threading.Lock()}
@@ -466,7 +500,17 @@ class Handler(BaseHTTPRequestHandler):
                         print(f"[battery] {lvl}% charged={_battery['charging']}")
                 except (ValueError, IndexError):
                     pass
-            png = render_png()
+            try:
+                png = render_png()
+            except Exception:
+                traceback.print_exc()
+                body = b"render error (revisa los logs del servidor)"
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             self.send_response(200)
             self.send_header("Content-Type", "image/png")
             self.send_header("Content-Length", str(len(png)))
@@ -499,6 +543,13 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     if not HA_TOKEN:
         print("AVISO: HA_TOKEN no definido; el render mostrara 'SIN DATOS HA'.")
+    if not F_BOLD or not F_REG:
+        print("ERROR: no encuentro las fuentes DejaVu (necesarias para el render).")
+        print("  Instala el paquete de tu distra (p. ej. fonts-dejavu /")
+        print("  dejavu-sans-fonts / ttf-dejavu) o fija FONT_DIR/FONT_BOLD/FONT_REG")
+        print("  en el entorno con la ruta a DejaVuSans.ttf y DejaVuSans-Bold.ttf.")
+        sys.exit(1)
+    print(f"Fuentes: {F_BOLD} / {F_REG}")
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"Sirviendo en 0.0.0.0:{PORT}  (PNG en /kindle.png)")
     srv.serve_forever()
