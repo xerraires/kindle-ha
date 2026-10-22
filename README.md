@@ -202,8 +202,3 @@ Con el Kindle conectado por USB (o SSH):
 - Licencia: [MIT](LICENSE) — usa el proyecto como quieras, trastéalo a gusto;
   cualquier duda, [abre un issue](../../issues) y me escribes.
 
----
-
-*Documentación de instalación avanzada y troubleshooting: ver `instrucciones.md`
-en la copia local (no se publica: contiene la topología de tu red y notas
-personales).*
