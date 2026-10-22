@@ -32,7 +32,7 @@ despertar RTC, mientras duerme.
   ajusta la resolución en `server/kindle-ha.py` (`W, H`) y ten en cuenta que
   los detalles del framework varían.
 - Un **PC/servidor siempre encendido** en la misma red que el Kindle
-  (Raspberry Pi va genial), con **Python 3**.
+  (yo uso un Intel Nuc, pero una raspberry funcionaria igual), con **Python 3**.
 - **Home Assistant** funcionando y accesible desde ambos.
 
 ## 2. Jailbreak del Kindle
@@ -48,8 +48,6 @@ modelo y firmware):
 
 Referencias complementarias:
 
-- Wiki de KOReader para Kindle (requisitos por modelo) →
-  <https://github.com/koreader/koreader/wiki/Kindle>
 - Foro **Kindle Developer's Corner** de MobileRead (donde se publican los
   hacks, MRPI, KUAL, USBNetwork, etc.) →
   <https://www.mobileread.com/forums/forumdisplay.php?f=150>
@@ -181,13 +179,9 @@ Con el Kindle conectado por USB (o SSH):
 
 ## 8. Seguridad
 
-- **Nunca subas el token de HA al repo**: vive en `server/.env` (ignorado por
-  git) y en el Kindle (`heartbeat_config.lua`). El `.gitignore` cubre `.env`,
-  `state.json` y `venv/`.
 - El dropbear de KOReader en el puerto 2222 **sin contraseña** es cómodo para
   pruebas pero cualquier equipo de tu red entra como root. Ponle contraseña o
   usa USBNetwork con claves.
-- Revisa siempre con `git status` qué vas a commitear antes del primer push.
 
 ## 9. Créditos
 
