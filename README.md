@@ -11,6 +11,12 @@ Renderizado con Pillow en el servidor (imagen PNG 758×1024, 8-bit gris, alto
 contraste para e-ink). El Kindle la descarga al suspenderse y cada hora con
 despertar RTC, mientras duerme.
 
+![Aspecto del salvapantallas (diseño actual)](preview.png)
+
+*Cabecera con batería, pronóstico semanal con barras de rango y `Ahora XX°`,
+y precio de la luz PVPC protagonista: tramo `PUNTA`/`MEDIO`/`VALLE`, precio
+actual, próxima subida/bajada, barras 24 h y `MIN`/`MAX`.*
+
 ## Índice
 
 1. [Prerrequisitos](#1-prerrequisitos)
@@ -191,6 +197,10 @@ Con el Kindle conectado por USB (o SSH):
   despertadas, refresco horario 24 h, refresco completo anti-ghosting).
 - [KOReader](https://koreader.rocks) · [Home Assistant](https://www.home-assistant.io)
   · [Kindle Modding Wiki](https://kindlemodging.org) · MobileRead.
+- Proyecto desarrollado con [pi](https://github.com/earendil-works/pi), un
+  agente de código que trabaja desde la terminal.
+- Licencia: [MIT](LICENSE) — usa el proyecto como quieras, trastéalo a gusto;
+  cualquier duda, [abre un issue](../../issues) y me escribes.
 
 ---
 
