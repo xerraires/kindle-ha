@@ -10,6 +10,10 @@ Uso:
 Endpoints:
   GET /kindle.png   -> imagen PNG 758x1024 (lo que pide el Kindle)
   GET /             -> estado / ultima actualizacion
+
+Config por variables de entorno: HA_URL, HA_TOKEN, PORT, DATA_TTL,
+WEATHER_ENTITY, PRICE_ENTITY, TITLE (rotulo de la cabecera) y
+FONT_DIR/FONT_BOLD/FONT_REG (fuentes; ver .env.example).
 """
 import os
 import io
@@ -81,6 +85,22 @@ _cache = {"ts": 0.0, "data": None, "lock": threading.Lock()}
 _STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 _battery = {"level": None, "charging": None, "ts": 0.0}
 
+# Historial horario del día en curso (temp por hora local). HA solo devuelve
+# horas FUTURAS en get_forecasts hourly; acumulando cada fetch tenemos el día
+# completo para el pie MIN/MAX de temperatura con horas reales.
+_HH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "weather_hours.json")
+_hh = {"day": None, "hours": {}}
+
+
+def _load_hh():
+    try:
+        with open(_HH_FILE) as f:
+            d = json.load(f)
+        if isinstance(d.get("hours"), dict):
+            _hh["day"], _hh["hours"] = d.get("day"), d["hours"]
+    except Exception:
+        pass
+
 
 def _load_battery():
     try:
@@ -102,12 +122,15 @@ def _save_battery():
 
 
 _load_battery()
+_load_hh()
 
 
 def _fetch_ha():
     headers = {"Authorization": f"Bearer {HA_TOKEN}",
                "Content-Type": "application/json"}
     data = {"weather": None, "prices": None, "current": None, "temp_now": None,
+            "hourly": None, "sunrise": None, "sunset": None,
+            "humidity": None, "wind_speed": None, "wind_unit": None,
             "min": None, "min_at": None, "max": None, "max_at": None,
             "error": None}
 
@@ -125,9 +148,56 @@ def _fetch_ha():
         r2 = requests.get(f"{HA_URL}/api/states/{WEATHER_ENTITY}",
                           headers=headers, timeout=15)
         r2.raise_for_status()
-        data["temp_now"] = r2.json().get("attributes", {}).get("temperature")
+        att = r2.json().get("attributes", {})
+        data["temp_now"] = att.get("temperature")
+        data["humidity"] = att.get("humidity")
+        data["wind_speed"] = att.get("wind_speed")
+        data["wind_unit"] = att.get("wind_speed_unit") or "km/h"
     except Exception as e:
         data["error"] = f"clima: {e}"
+
+    # --- Pronostico horario (curva del dia) ---
+    try:
+        r3 = requests.post(
+            f"{HA_URL}/api/services/weather/get_forecasts?return_response=1",
+            headers=headers,
+            json={"entity_id": WEATHER_ENTITY, "type": "hourly"},
+            timeout=15,
+        )
+        r3.raise_for_status()
+        resp = r3.json().get("service_response", {}).get(WEATHER_ENTITY, {})
+        data["hourly"] = resp.get("forecast", [])[:48]
+        # acumular el historial horario del día en curso (hora local)
+        today = datetime.now().strftime("%Y-%m-%d")
+        if _hh.get("day") != today:
+            _hh["day"], _hh["hours"] = today, {}
+        for e in (data.get("hourly") or []):
+            try:
+                hdt = datetime.fromisoformat(e["datetime"])
+                if hdt.tzinfo is not None:
+                    hdt = hdt.astimezone().replace(tzinfo=None)
+            except Exception:
+                continue
+            t = e.get("temperature")
+            if t is not None and hdt.strftime("%Y-%m-%d") == today:
+                _hh["hours"][str(hdt.hour)] = float(t)
+        try:
+            with open(_HH_FILE, "w") as f:
+                json.dump(_hh, f)
+        except Exception:
+            pass
+    except Exception as e:
+        data["error"] = (data["error"] + f"; horario: {e}") if data["error"] else f"horario: {e}"
+
+    # --- Sol: amanece/atardece (sun.sun) ---
+    try:
+        r4 = requests.get(f"{HA_URL}/api/states/sun.sun", headers=headers, timeout=15)
+        r4.raise_for_status()
+        att = r4.json().get("attributes", {})
+        data["sunrise"] = att.get("next_rising")
+        data["sunset"] = att.get("next_setting")
+    except Exception as e:
+        data["error"] = (data["error"] + f"; sol: {e}") if data["error"] else f"sol: {e}"
 
     # --- Precio PVPC ---
     try:
@@ -164,6 +234,26 @@ def get_data():
     return d
 
 
+def _bg_loop():
+    """Refresco horario de fondo: aunque el Kindle duerma (o falle un ciclo)
+    seguimos consultando HA cada hora. Mantiene el historial horario del día
+    (_hh) completo para el pie MIN/MAX con horas, y la caché caliente."""
+    while True:
+        time.sleep(60)
+        try:
+            with _cache["lock"]:
+                stale = (_cache["data"] is not None
+                         and time.time() - _cache["ts"] >= 3600)
+            if stale:
+                d = _fetch_ha()
+                if d.get("weather") or d.get("prices"):
+                    with _cache["lock"]:
+                        _cache["data"] = d
+                        _cache["ts"] = time.time()
+        except Exception:
+            pass
+
+
 # ---------------- Utilidades de dibujo ----------------
 def font(size, bold=True):
     return ImageFont.truetype(F_BOLD if bold else F_REG, size)
@@ -174,14 +264,22 @@ def text_w(draw, s, fnt):
     return b[2] - b[0]
 
 
-def draw_centered(draw, xy, s, fnt, fill=0):
+def draw_centered(draw, xy, s, fnt, fill=0, stroke=0):
     w = text_w(draw, s, fnt)
     x, y = xy
-    draw.text((x - w / 2, y), s, font=fnt, fill=fill)
+    draw.text((x - w / 2, y), s, font=fnt, fill=fill,
+              stroke_width=stroke, stroke_fill=255 if stroke else None)
 
 
 def draw_right(draw, xr, y, s, fnt, fill=0):
     draw.text((xr - text_w(draw, s, fnt), y), s, font=fnt, fill=fill)
+
+
+def to_local_naive(dt):
+    """Normaliza un datetime (aware o naive) a hora local naive."""
+    if dt.tzinfo is not None:
+        return dt.astimezone().replace(tzinfo=None)
+    return dt
 
 
 def fmt_price(v):
@@ -200,16 +298,23 @@ def price_band(prices, current):
     return "PUNTA", 2
 
 
-def next_change(prices, cur_hour):
-    """(palabra, hora) de la proxima variacion notable, o None."""
-    if cur_hour < 0 or cur_hour >= len(prices) - 1:
-        return None
-    p0 = prices[cur_hour]
-    for h in range(cur_hour + 1, len(prices)):
-        diff = prices[h] - p0
-        if abs(diff) >= 0.005:
-            return ("Sube" if diff > 0 else "Baja", h)
-    return None
+def optimal_hours(prices, cur_hour):
+    """La hora(s) más barata(s) del DÍA entero, agrupadas en rangos.
+    Devuelve (rangos [h_ini,h_fin], precio_min, pasada); pasada=True cuando
+    la hora actual ya superó la última hora óptima (-> "No hay hora óptima")."""
+    pmin = min(prices)
+    cand = [h for h, p in enumerate(prices) if p == pmin]
+    ranges = []
+    for h in cand:
+        if ranges and h == ranges[-1][1] + 1:
+            ranges[-1][1] = h
+        else:
+            ranges.append([h, h])
+    if cur_hour is not None and 0 <= cur_hour < len(prices):
+        passed = cur_hour > ranges[-1][1]
+    else:
+        passed = False
+    return ranges, pmin, passed
 
 
 COND_ES = {
@@ -308,77 +413,220 @@ def render():
 
     d.line([(20, 94), (W - 20, 94)], fill=0, width=2)
 
-    # ----- Tiempo (arriba): filas con barra de rango -----
+    # ----- Tiempo (arriba): curva horaria del día + sol + strip diario -----
     if data.get("weather"):
-        days = data["weather"][:5]
-        rest = data["weather"][5:7]
+        days = data["weather"][:7]
+        hourly = data.get("hourly") or []
 
-        f_sec = font(22)
-        d.text((24, 102), "PRONOSTICO", font=f_sec, fill=0)
+        # sol: amanecer/atardecer parseados (cabecera + sombreado nocturno)
+        rise_dt = set_dt = None
+        for iso in (data.get("sunrise"), data.get("sunset")):
+            if not iso:
+                continue
+            try:
+                dt = to_local_naive(datetime.fromisoformat(iso))
+            except Exception:
+                continue
+            if rise_dt is None:
+                rise_dt = dt
+            else:
+                set_dt = dt
+
+        # fila donde estaba "TIEMPO": Ahora/H/V a la izquierda, sol a la der
+        extra = []
         if data.get("temp_now") is not None:
-            f_ahora = font(22)
-            txt = f"Ahora {round(data['temp_now'])}°"
-            draw_right(d, R, 102, txt, f_ahora)
+            extra.append(f"Ahora {round(data['temp_now'])}°")
+        if data.get("humidity") is not None:
+            extra.append(f"{int(data['humidity'])}%")
+        if data.get("wind_speed") is not None:
+            extra.append(f"V {int(round(data['wind_speed']))}")
+        if extra:
+            d.text((24, 102), "  ".join(extra), font=font(20), fill=0)
+        if rise_dt is not None and set_dt is not None:
+            f_sol = font(20)
+            t1 = f"↑ {rise_dt.strftime('%H:%M')}"
+            t2 = f"↓ {set_dt.strftime('%H:%M')}"
+            draw_right(d, R, 102, t1 + "   " + t2, f_sol)
 
-        # escala global de la semana para las barras de rango
-        tmaxs = [day["temperature"] for day in days if day.get("temperature") is not None]
-        tmins = [day["templow"] for day in days if day.get("templow") is not None]
-        gmin = min(tmins) if tmins else 0
-        gmax = max(tmaxs) if tmaxs else 30
-        span = max(gmax - gmin, 1)
+        # puntos horarios para la curva (las próximas ~24 h de HA)
+        # ojo: los datetimes de la previsión llegan en UTC -> normalizar a
+        # hora local naive, o toda la curva (etiquetas, sol, medianoche)
+        # sale desplazada 1 h
+        pts = []
+        for e in hourly:
+            try:
+                hdt = datetime.fromisoformat(e["datetime"])
+                if hdt.tzinfo is not None:
+                    hdt = hdt.astimezone().replace(tzinfo=None)
+            except Exception:
+                continue
+            t = e.get("temperature")
+            if t is None:
+                continue
+            pts.append({"dt": hdt, "temp": float(t),
+                        "prob": e.get("precipitation_probability"),
+                        "cond": e.get("condition", "")})
+            if len(pts) >= 24:
+                break
 
-        f_day = font(26)
-        f_tmin = font(20)
-        f_tmax = font(26)
-        f_cond = font(15)
-        row_h = 50
-        y0 = 136
-        bx0, bx1 = 262, 540  # zona de la barra de rango
+        if pts:
+            bx0, bx1 = 40, 718
+            n = len(pts)
+            slot = (bx1 - bx0) / max(n - 1, 1)
+            ctop, cbot = 152, 278
+            tmax = max(p["temp"] for p in pts)
+            tmin = min(p["temp"] for p in pts)
+            span = max(tmax - tmin, 1.0)
+            imax = next(i for i, p in enumerate(pts) if p["temp"] == tmax)
+            imin = next(i for i, p in enumerate(pts) if p["temp"] == tmin)
 
-        for i, day in enumerate(days):
-            cy = y0 + row_h * i + row_h / 2
+            def X(i):
+                return bx0 + slot * i
+
+            def Y(v):
+                # máx arriba (ctop), mín abajo (cbot)
+                return cbot - (v - tmin) / span * (cbot - ctop)
+
+            coords = [(X(i), Y(p["temp"])) for i, p in enumerate(pts)]
+
+            # calidad de cobertura horaria por día (para el strip: si la
+            # curva cubre el alba y la tarde de un día, sus tmin/tmax son
+            # derivables de la curva y pueden diferir del daily oficial)
+            by_day = {}
+            for p in pts:
+                dkey = p["dt"].strftime("%Y-%m-%d")
+                e = by_day.setdefault(dkey, {"temps": [], "hours": []})
+                e["temps"].append(p["temp"])
+                e["hours"].append(p["dt"].hour)
+
+            # área rellena bajo la curva (gris claro) + línea negra encima
+            poly = [(bx0, cbot + 2)] + coords + [(bx1, cbot + 2)]
+            d.polygon(poly, fill=224)
+            for i in range(len(coords) - 1):
+                d.line([coords[i], coords[i + 1]], fill=0, width=3)
+
+            # marca de cambio de día: línea vertical + etiqueta MAÑANA
+            # (la etiqueta a ctop+3, para no pisar la fila "Ahora/sol" de arriba)
+            for i, p in enumerate(pts):
+                if i > 0 and p["dt"].day != pts[i - 1]["dt"].day:
+                    xm = X(i) - slot / 2
+                    d.line([(xm, ctop - 14), (xm, cbot + 12)], fill=160,
+                           width=2)
+                    draw_centered(d, (xm, ctop + 3), "MAÑANA", font(13),
+                                  stroke=2)
+                    break
+
+            for i, (x, y) in enumerate(coords):
+                if i % 3 == 0:
+                    # icono cada 3 h, con fondo blanco para "abrir" la curva
+                    d.rectangle([x - 14, y - 14, x + 14, y + 14], fill=255)
+                    draw_icon(d, pts[i]["cond"], x, y, 10)
+                else:
+                    d.ellipse([x - 3, y - 3, x + 3, y + 3], fill=0)
+
+            # barras de probabilidad de lluvia, alineadas con los puntos
+            base, bh_max = 310, 26
+            for i, p in enumerate(pts):
+                prob = p.get("prob")
+                if prob is None or prob <= 0:
+                    continue
+                x = X(i)
+                hgt = max(prob / 100.0 * bh_max, 1.5)
+                d.rectangle([x - 5, base - hgt, x + 5, base], fill=128)
+                if prob >= 50:
+                    draw_centered(d, (x, base - hgt - 16), f"{int(prob)}",
+                                  font(13), fill=128)
+
+            f_lbl = font(18)
+            # halo blanco: legibles aunque caigan sobre iconos, curva o barras
+            draw_centered(d, (coords[imax][0], coords[imax][1] - 26),
+                          f"{int(round(tmax))}°", f_lbl, stroke=3)
+            draw_centered(d, (coords[imin][0], coords[imin][1] + 8),
+                          f"{int(round(tmin))}°", f_lbl, stroke=3)
+
+            # fila de horas (pegada a las barras), ticks cada 3 h
+            f_h = font(15)
+            for ti in range(0, len(pts), 3):
+                draw_centered(d, (X(ti), 318),
+                              f"{pts[ti]['dt'].strftime('%H')}h", f_h, fill=128)
+
+        # strip diario compacto y centrado (mini-icono + día + tmin/tmax):
+        # sin HOY (el día en curso va en el pie MIN/MAX), un día más.
+        # Coherencia con la curva: cuando la ventana horaria cubre el alba y
+        # la tarde de un día del strip, su tmin/tmax salen de la CURVA (el
+        # daily oficial puede diferir en ±1° y no debe contradecirla).
+        f_d1 = font(20)
+        parts = []
+        for day in days[1:5]:
             dt = datetime.fromisoformat(day["datetime"])
-            wd = WD_ES[dt.weekday()] if i > 0 else "HOY"
-            d.text((24, cy - 16), wd, font=f_day, fill=0)
+            if dt.tzinfo is not None:
+                dt = dt.astimezone().replace(tzinfo=None)
+            lbl = WD_ES[dt.weekday()]
+            dhi = day.get("temperature")
+            dlo = day.get("templow")
+            covered = by_day.get(dt.strftime("%Y-%m-%d"))
+            if covered and min(covered["hours"]) <= 1 \
+                    and max(covered["hours"]) >= 18:
+                dhi = max(covered["temps"])
+                dlo = min(covered["temps"])
+            txt = lbl
+            if dhi is not None:
+                if dlo is not None:
+                    txt += f" {int(round(dlo))}°/{int(round(dhi))}°"
+                else:
+                    txt += f" {int(round(dhi))}°"
+            parts.append((day.get("condition", ""), txt))
+        gap = 34
+        total = sum(26 + text_w(d, t, f_d1) for _, t in parts) \
+            + gap * (len(parts) - 1)
+        x = (W - total) / 2
+        y = 348
+        for cond, txt in parts:
+            draw_icon(d, cond, x + 9, y + 13, 9)
+            x += 26
+            d.text((x, y), txt, font=f_d1, fill=0)
+            x += text_w(d, txt, f_d1) + gap
 
-            kind = day.get("condition", "")
-            draw_icon(d, kind, 168, cy, 17)
+        # pie de temperatura del DÍA EN CURSO (estilo pie del precio).
+        # Con horas reales solo si el historial horario cubre el día completo;
+        # si no, los valores oficiales del pronóstico diario, sin horas
+        f_mm_t = font(20)
+        today = now.strftime("%Y-%m-%d")
+        hist = (_hh.get("hours") or {}) if _hh.get("day") == today else {}
+        merged = dict(hist)
+        for p in pts:
+            if p["dt"].strftime("%Y-%m-%d") == today:
+                merged[p["dt"].hour] = p["temp"]
+        dlo = days[0].get("templow")
+        dhi = days[0].get("temperature")
+        tmn = tmx = None
+        # hay horas cuando el día cubre ~las 24 h (el forecast horario empieza
+        # en la hora SIGUIENTE, así que a las 00:00 se capturan 1–23: primero
+        # refresco del día = día completo menos la hora 0)
+        if len(merged) >= 23:
+            hmin = min(merged, key=merged.get)
+            hmax = max(merged, key=merged.get)
+            tmn = f"MIN {int(round(merged[hmin]))}° ({int(hmin):02d}h)"
+            tmx = f"MAX {int(round(merged[hmax]))}° ({int(hmax):02d}h)"
+        elif dlo is not None or dhi is not None:
+            if dlo is not None:
+                tmn = f"MIN {int(round(dlo))}°"
+            if dhi is not None:
+                tmx = f"MAX {int(round(dhi))}°"
+        if tmn or tmx:
+            wmin = text_w(d, tmn, f_mm_t) if tmn else 0
+            wmax = text_w(d, tmx, f_mm_t) if tmx else 0
+            x0 = (W - (wmin + 32 + wmax)) / 2
+            if tmn:
+                d.text((x0, 382), tmn, font=f_mm_t, fill=0)
+            if tmx:
+                d.text((x0 + wmin + 32, 382), tmx, font=f_mm_t, fill=0)
 
-            tmax = day.get("temperature")
-            tmin = day.get("templow")
-            if tmin is not None:
-                draw_right(d, bx0 - 16, cy - 12, f"{int(round(tmin))}°",
-                           f_tmin, fill=128)
-            if tmax is not None:
-                draw_right(d, bx1 + 70, cy - 16, f"{int(round(tmax))}°", f_tmax)
-
-            # barra de rango: linea gris + tramo negro [tmin..tmax] escalado
-            if tmin is not None and tmax is not None:
-                d.line([(bx0, cy), (bx1, cy)], fill=192, width=6)
-                xa = bx0 + (tmin - gmin) / span * (bx1 - bx0)
-                xb = bx0 + (tmax - gmin) / span * (bx1 - bx0)
-                d.line([(xa, cy), (xb, cy)], fill=0, width=6)
-                d.ellipse([xa - 4, cy - 4, xa + 4, cy + 4], fill=0)
-                d.ellipse([xb - 4, cy - 4, xb + 4, cy + 4], fill=0)
-
-            cond = COND_ES.get(kind, kind)
-            draw_right(d, R, cy - 9, cond, f_cond, fill=128)
-
-        if rest:
-            parts = []
-            for day in rest:
-                dt = datetime.fromisoformat(day["datetime"])
-                wd = WD_ES[dt.weekday()]
-                parts.append(f"{wd} {int(round(day['temperature']))}°/"
-                             f"{int(round(day['templow']))}°")
-            d.text((24, y0 + row_h * 5 + 2), "   ".join(parts),
-                   font=font(16), fill=128)
-
-    d.line([(20, 428), (W - 20, 428)], fill=128, width=2)
+    d.line([(20, 440), (W - 20, 440)], fill=128, width=2)
 
     # ----- Precio (abajo): protagonista -----
     f_sec = font(26)
-    d.text((24, 436), "PRECIO LUZ", font=f_sec, fill=0)
+    d.text((24, 448), "PRECIO LUZ", font=f_sec, fill=0)
 
     prices = data.get("prices")
     current = data.get("current")
@@ -389,7 +637,7 @@ def render():
         f_badge = font(20)
         tw = text_w(d, band, f_badge)
         bw, bh = tw + 28, 34
-        bx, by = R - bw, 434
+        bx, by = R - bw, 446
         if bi == 2:      # PUNTA: negro, texto blanco
             d.rectangle([bx, by, bx + bw, by + bh], fill=0)
             d.text((bx + 14, by + 4), band, font=f_badge, fill=255)
@@ -404,20 +652,30 @@ def render():
     if current is not None:
         f_big = font(92)
         txt = fmt_price(current)
-        d.text((20, 478), txt, font=f_big, fill=0)
-        d.text((24 + text_w(d, txt, f_big) + 16, 545), "€/kWh",
+        d.text((20, 490), txt, font=f_big, fill=0)
+        d.text((24 + text_w(d, txt, f_big) + 16, 557), "€/kWh",
                font=font(26), fill=0)
 
-    # proxima subida/bajada
+    # hora óptima: la más barata del DÍA; al pasarla, "No hay hora óptima"
     if prices:
+        f_opt = font(22)
         cur_hour = now.hour if len(prices) == 24 else -1
-        nc = next_change(prices, cur_hour)
-        f_nc = font(22)
-        if nc:
-            word, h = nc
-            draw_right(d, R, 500, f"{word} a las {h:02d}h", f_nc)
+        ranges, pmin, past = optimal_hours(prices, cur_hour)
+        if ranges and not past:
+            def hr(r):
+                return (f"{r[0]:02d}h" if r[0] == r[1]
+                        else f"{r[0]:02d}–{r[1]:02d}h")
+            if len(ranges) == 1:
+                label = "ÓPTIMA " + hr(ranges[0])
+            elif len(ranges) == 2:
+                label = "ÓPTIMAS " + hr(ranges[0]) + " y " + hr(ranges[1])
+            else:
+                label = "ÓPTIMAS " + hr(ranges[0]) + ", " + hr(ranges[1]) + ", …"
+            if pmin is not None:
+                label += f" · {fmt_price(pmin)} €"
+            draw_right(d, R, 512, label, f_opt)
         else:
-            draw_right(d, R, 500, "Precio estable", f_nc, fill=128)
+            draw_right(d, R, 512, "No hay hora óptima", f_opt, fill=128)
 
     # barras 24h
     if prices:
@@ -513,6 +771,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_response(200)
             self.send_header("Content-Type", "image/png")
+            self.send_header("X-Host-Epoch", str(time.time()))
             self.send_header("Content-Length", str(len(png)))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
@@ -550,6 +809,7 @@ def main():
         print("  en el entorno con la ruta a DejaVuSans.ttf y DejaVuSans-Bold.ttf.")
         sys.exit(1)
     print(f"Fuentes: {F_BOLD} / {F_REG}")
+    threading.Thread(target=_bg_loop, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"Sirviendo en 0.0.0.0:{PORT}  (PNG en /kindle.png)")
     srv.serve_forever()
