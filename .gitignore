@@ -1,6 +1,7 @@
 # estado local / secretos
 .env
 state.json
+weather_hours.json
 venv/
 __pycache__/
 *.pyc

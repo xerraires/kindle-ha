@@ -3,8 +3,13 @@
 Convierte un Kindle Paperwhite antiguo en un salvapantallas de Home Assistant
 que se **actualiza cada hora, 24 h/día**, mostrando:
 
-- Pronóstico del tiempo de tu entidad `weather.*` (rango de temperaturas por día, estilo Apple)
-- Precio de la luz PVPC (España): precio actual, badge `VALLE`/`MEDIO`/`PUNTA`, barras 24 h, `MIN`/`MAX`
+- Pronóstico del tiempo de tu entidad `weather.*`: **curva horaria de
+  temperatura** de las próximas ~24 h (área rellena, iconos cada 3 h, máx/mín
+  etiquetados, cambio de día), sol (↑ amanece ↓ atardece), barras de
+  probabilidad de lluvia, strip compacto de los días siguientes y pie
+  `MIN`/`MAX (XXh)` del día en curso
+- Precio de la luz PVPC (España): precio actual, badge `VALLE`/`MEDIO`/`PUNTA`,
+  `ÓPTIMA HHh · 0,XXX €` (la hora más barata del día), barras 24 h, `MIN`/`MAX`
 - Batería del propio Kindle (cabecera) y aviso en HA si baja del 20 %
 
 Renderizado con Pillow en el servidor (imagen PNG 758×1024, 8-bit gris, alto
@@ -18,9 +23,9 @@ despertar RTC, mientras duerme.
 > como guía de referencia ni para nada crítico: sigue los pasos bajo tu propia
 > responsabilidad, y el código puede tener errores — probablemente los tiene.
 
-*Cabecera con batería, pronóstico semanal con barras de rango y `Ahora XX°`,
-y precio de la luz PVPC protagonista: tramo `PUNTA`/`MEDIO`/`VALLE`, precio
-actual, próxima subida/bajada, barras 24 h y `MIN`/`MAX`.*
+*Cabecera con batería, curva horaria de temperatura con sol y precipitación,
+strip de los días siguientes, y precio de la luz PVPC protagonista: tramo
+`PUNTA`/`MEDIO`/`VALLE`, precio actual, `ÓPTIMA HHh`, barras 24 h y `MIN`/`MAX`.*
 
 ## Índice
 
@@ -118,6 +123,23 @@ El refresco horario lo programa el parche con el wakeup manager de KOReader
 (RTC a la hora en punto, reconexión WiFi incluida).
 ```
 
+Detalles que conviene conocer:
+
+- **Cache de datos HA** con TTL configurable (`DATA_TTL`, por defecto 300 s);
+  las entidades se fijan con `WEATHER_ENTITY`, `PRICE_ENTITY` y el título de la
+  cabecera con `TITLE` (ver `.env.example`).
+- **Histórico horario del día** (`weather_hours.json`, autogenerado junto al
+  script): HA solo devuelve horas *futuras* en el forecast horario; el servidor
+  acumula las temperaturas del día en cada fetch para poder pintar el pie
+  `MIN XX° (HHh) / MAX XX° (HHh)` con horas reales.
+- **Refresco de fondo**: un hilo interno reconsulta HA cada hora si el Kindle no
+  fetchea (está dormido o falló un ciclo), para que el histórico y la caché no
+  se queden a medias.
+- **Sincronización de reloj**: cada respuesta lleva `X-Host-Epoch` (epoch del
+  host); el parche (`syncClock`) corrige solo la desviación sub-horaria del
+  reloj del Kindle, para que las alarmas RTC sigan cayendo en el `:00` del host
+  (sin esto, las actualizaciones se disparaban a las `xx:59`).
+
 Instalación del servidor:
 
 ```bash
@@ -155,6 +177,9 @@ Con el Kindle conectado por USB (o SSH):
    - Flags de emergencia (crear/borrar ficheros en la raíz USB):
      `live-sleepscreen.nowake` (desactiva despertares) y
      `live-sleepscreen.fasttest` (despertar cada 5 min para probar).
+   - El parche sincroniza automáticamente su reloj con el servidor en cada
+     fetch (`X-Host-Epoch` → `syncClock`); si tu servidor no es
+     `kindle-ha.py`, esta parte no hará nada.
 2. **Pantalla de reposo**: copia también `koreader/patches/koreader.settings.lua`
    (o pega sus claves en tus settings) para que el salvapantallas de KOReader
    muestre `wallpaper.png` sin mensajes.
