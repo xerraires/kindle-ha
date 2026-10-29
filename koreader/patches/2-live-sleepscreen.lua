@@ -177,6 +177,54 @@ local function getBattery()
     return lvl, charging
 end
 
+-- Sincronización de reloj (fix de las actualizaciones a las xx:59):
+-- el reloj del Kindle deriva respecto al host y las alarmas armadas para el
+-- ":00 del Kindle" acababan disparando cuando el host marcaba xx:59. La
+-- respuesta de kindle-ha.py trae X-Host-Epoch (epoch del host); corregimos
+-- SOLO la desviación de minutos/segundos (redondeando delta a horas enteras),
+-- sin tocar el desfase horario del Kindle (tema de zona horaria). Se hace
+-- tras cada fetch, ANTES de rearmar la alarma, para que su :00 siga cayendo
+-- en el :00 del host.
+local CLOCK_SYNC_MIN = 20 -- deriva sub-horaria (s) que se corrige
+
+local function syncClock(headers)
+    local v = headers and (headers["x-host-epoch"] or headers["X-Host-Epoch"])
+    local host_epoch = v and tonumber(v)
+    if not host_epoch then
+        logger.info(LOG, "clock sync: sin X-Host-Epoch, no se corrige")
+        return
+    end
+    local now = os.time()
+    local delta = host_epoch - now
+    -- desviación descontando horas enteras: delta - round(delta/3600)*3600
+    local residual = delta - math.floor(delta / 3600 + 0.5) * 3600
+    if math.abs(residual) < CLOCK_SYNC_MIN then
+        logger.info(LOG, string.format("clock ok (delta %d s)", delta))
+        return
+    end
+    local target = now + residual
+    -- aplicar (date -s; busybox) y verificar leyendo el reloj justo después
+    local function check(fmt, arg)
+        local out = io.popen(string.format('date -s ' .. fmt ..
+            ' >/dev/null 2>&1; date +%%s', arg))
+        local s = out and out:read("*l")
+        if out then out:close() end
+        local applied = tonumber(s)
+        return applied and math.abs(applied - target) <= 2
+    end
+    local ok = check('"@%d"', target)
+    if not ok then
+        -- fallback: date -s "YYYY-MM-DD HH:MM:SS" (hora local)
+        ok = check('"%s"', os.date("%Y-%m-%d %H:%M:%S", target))
+    end
+    if ok then
+        logger.info(LOG, string.format(
+            "clock synced: delta %d s, corregidos %d s", delta, residual))
+    else
+        logger.info(LOG, "clock sync: no pude fijar la hora (date -s)")
+    end
+end
+
 local function fetchWallpaper(token)
     local lvl, charging = getBattery()
     local url = IMAGE_URL
@@ -188,15 +236,21 @@ local function fetchWallpaper(token)
     if not fh then return end
     -- tight timeouts: this can block the sleep-screen paint
     socketutil:set_timeout(5, 10)
-    local code = socket.skip(1, http.request({
+    -- capturamos también las cabeceras: kindle-ha.py devuelve X-Host-Epoch
+    local a, b, c, e = http.request({
         url = url,
         method = "GET",
         headers = authHeaders(token),
         sink = socketutil.file_sink(fh),
-    }))
+    })
     socketutil:reset_timeout()
+    -- el código va en el 2º valor (verificado: skip(1) tomaba el código);
+    -- cabeceras en el 3º (LTN12) o 3º/4º según forma de retorno
+    local code = tonumber(b) or tonumber(a)
+    local headers = (tonumber(b) and c) or e
     if code == 200 then
         os.rename(tmp, TARGET)
+        pcall(syncClock, headers)
         logger.info(LOG, "wallpaper updated")
     else
         pcall(function() fh:close() end) -- sink never closed it on early failure
